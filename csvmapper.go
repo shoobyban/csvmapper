@@ -1,92 +1,185 @@
 package main
 
 import (
+	"bufio"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/shoobyban/filehelper"
 )
 
-func processMapping(newline *map[string]interface{}, origkey string, line map[string]string, key string) error {
-	// a.CONCAT#Separator#LabelAndInnerSeparator
-	// example: in case LabelAndInnerSeparator is 'Label=' and Separator ','
-	// a's value will be Label=value1,Label2=value2
-	// the # can be replaced by any character that's not in Separator or LabelAndInnerSeparator
-	if strings.Contains(key, ".CONCAT") {
-		i := strings.Index(key, ".CONCAT")
-		ss := strings.Split(key, key[i+7:i+8])
-		k := key[:i] // first part is the real key
-		//		fmt.Printf("'%s': %d %v '%s'\n", key, i, ss, k)
-		if val, ok := (*newline)[k]; ok && val != "" {
-			// already existing value + first separator + second part + value
-			if line[origkey] == "" {
-				return nil
+var mapCache = map[string]map[string]string{}
+
+func processMapping(newline *map[string]interface{}, key string, line map[string]string, origkey string) error {
+	// Example for concatenating data based on multiple columns (multiline):
+	// `a.CONCAT |
+	// {{template, using .value, .line}}
+	// {{some other template}}`
+	//
+	// Simpler example using template:
+	// {{ .value }} or {{ .line.othercolumn }}
+	value := line[origkey]
+	if strings.HasPrefix(origkey, "CONCAT") {
+		i := strings.Index(origkey, "CONCAT")
+		ss := strings.Split(origkey, "\n")
+		glue := strings.TrimPrefix(ss[0], "CONCAT ")
+		sub := []string{}
+		for _, item := range ss[1:] {
+			val, err := filehelper.Template(item, map[string]interface{}{"value": value, "out": newline, "out_key": origkey[i+3 : len(origkey)-2], "line": line})
+			if err != nil {
+				j, _ := json.MarshalIndent(line, "", " ")
+				fmt.Println(string(j))
+				panic(err)
 			}
-			(*newline)[k] = val.(string) + ss[1] + ss[2] + line[origkey]
-			return nil
+			if val != "" {
+				sub = append(sub, val)
+			}
 		}
-		// second part + value
-		if line[origkey] == "" {
-			(*newline)[k] = ""
-			return nil
-		}
-		(*newline)[k] = ss[2] + line[origkey]
+		(*newline)[key] = strings.Join(sub, glue)
 		return nil
 	}
-	if strings.Contains(key, ".{{") && strings.HasSuffix(key, "}}") {
-		i := strings.Index(key, ".{{")
-		k := key[:i]
-		val, err := filehelper.Template(key[i+1:len(key)], map[string]interface{}{"orig": line[origkey], "inkey": origkey, "out": newline, "in": line, "outkey": key[i+3 : len(key)-2]})
+	if strings.Contains(origkey, ".{{") && strings.HasSuffix(origkey, "}}") {
+		i := strings.Index(origkey, ".{{")
+		k := origkey[:i]
+		val, err := filehelper.Template(origkey[i+1:len(origkey)], map[string]interface{}{"value": value, "in_key": k, "out": newline, "out_key": origkey[i+3 : len(origkey)-2], "line": line})
+		if err != nil {
+			j, _ := json.MarshalIndent(line, "", " ")
+			fmt.Println(string(j))
+			panic(err)
+		}
+		(*newline)[key] = val
+		return nil
+	}
+	if strings.HasPrefix(origkey, "MAP(") && strings.HasSuffix(origkey, ")") {
+		ss := strings.Split(origkey[4:len(origkey)-1], ":")
+		if len(ss) < 2 || len(ss) > 4 {
+			j, _ := json.MarshalIndent(line, "", " ")
+			fmt.Println(string(j))
+			panic("MAP(mapping.csv:key{:separator}{:newseparator}) where mapping.csv is (for example) id,path structure, separator and new separator optional")
+		}
+		var m map[string]string
+		var ok bool
+		m, ok = mapCache[ss[0]]
+		if !ok {
+			m = map[string]string{}
+			csvFile, _ := os.Open(ss[0])
+			defer csvFile.Close()
+			reader := csv.NewReader(bufio.NewReader(csvFile))
+			records, err := reader.ReadAll()
+			if err != nil {
+				j, _ := json.MarshalIndent(line, "", " ")
+				fmt.Println(string(j))
+				panic(err)
+			}
+			for _, r := range records {
+				m[strings.ToLower(r[1])] = r[0]
+			}
+			mapCache[ss[0]] = m
+		}
+		if len(ss) == 2 {
+			v, ok := m[line[ss[1]]]
+			if ok {
+				(*newline)[key] = v
+			}
+		} else {
+			sss := strings.Split(line[ss[1]], ss[2])
+			vv := []string{}
+			for _, s := range sss {
+				v, ok := m[strings.ToLower(s)]
+				if ok {
+					vv = append(vv, v)
+				} else if s != "" {
+					fmt.Println("Couldn't find " + s)
+				}
+			}
+			if len(ss) > 3 {
+				(*newline)[key] = strings.Join(vv, ss[3])
+			} else {
+				(*newline)[key] = strings.Join(vv, ss[2])
+			}
+		}
+		return nil
+	}
+	if strings.HasPrefix(origkey, "LS(") && strings.HasSuffix(origkey, ")") {
+		ss := strings.Split(origkey[3:len(origkey)-1], ":")
+		if len(ss) != 3 {
+			panic("LS(folder:{{ template }}:separator)")
+		}
+		glob, err := filehelper.Template(ss[1], map[string]interface{}{"value": value, "in_key": key, "out": newline, "out_key": ss[0], "line": line})
 		if err != nil {
 			panic(err)
 		}
-		(*newline)[k] = val
-		return nil
-	}
-	// (a,b) => copy it to both fields
-	if strings.HasPrefix(key, "(") && strings.HasSuffix(key, ")") && strings.Contains(key, ",") {
-		list := strings.Split(key[1:len(key)-1], ",")
-		for _, k := range list {
-			(*newline)[k] = line[origkey]
+		files, err := filepath.Glob(filepath.Join(ss[0], glob))
+		if err != nil {
+			panic(err)
 		}
+
+		(*newline)[key] = strings.Join(files, ss[2])
+
 		return nil
 	}
 	// default, use key
-	(*newline)[key] = line[origkey]
+	(*newline)[key] = value
 	return nil
+}
+
+func batchLines(lines []map[string]string, mainkey, separator string) (ret []map[string]string) {
+	last := -1
+	for _, line := range lines {
+		if line[mainkey] != "" {
+			ret = append(ret, line)
+			last++
+			for k, val := range line {
+				ret[last][k+"_BATCHED"] = ret[last][k+"_BATCHED"] + separator + val
+			}
+		} else {
+			for k, val := range line {
+				ret[last][k+"_BATCHED"] = ret[last][k+"_BATCHED"] + separator + val
+				if val != "" {
+					ret[last][k] = ret[last][k] + separator + val
+				}
+			}
+		}
+	}
+	return
 }
 
 func main() {
 	if len(os.Args) < 4 {
-		fmt.Println("Usage: csvmapper [mapping_config.csv] [from.csv] [to.csv]")
+		fmt.Println("Usage: csvmapper [mapping_config.csv] [from.csv] [to.csv] {separator}")
 		os.Exit(0)
 	}
 	mm, mh, err := filehelper.ReadCSV(os.Args[1])
+
+	order := []string{}
 	if err != nil {
 		panic(err)
 	}
-	if mh[0] != "from" && mh[1] != "to" {
+	if mh[0] != "to" && mh[1] != "from" && mh[2] != "flags" {
 		panic("First argument is not a mapping CSV")
 	}
 	mapping := map[string]string{}
 	flags := map[string]string{}
 	for _, m := range mm {
-		if m["to"] != "" {
-			mapping[m["from"]] = m["to"]
-		}
-		if strings.HasPrefix(m["to"], "(") && strings.HasSuffix(m["to"], ")") && strings.Contains(m["to"], ",") {
-			list := strings.Split(m["to"][1:len(m["to"])-1], ",")
-			for _, k := range list {
-				flags[k] = m["flags"]
-			}
-		} else {
-			flags[m["to"]] = m["flags"]
-		}
+		order = append(order, m["to"])
+		mapping[m["to"]] = m["from"]
+		flags[m["to"]] = m["flags"]
 	}
 
-	csvdata, head, err := filehelper.ReadCSV(os.Args[2])
+	csvdata, _, err := filehelper.ReadCSV(os.Args[2])
+
+	if err != nil {
+		panic(err)
+	}
+
+	//	fmt.Printf("%v", csvdata)
+
+	csvdata = batchLines(csvdata, "sku", "ƒ")
+
 	if err != nil {
 		panic(err)
 	}
@@ -100,9 +193,21 @@ func main() {
 	for ln, line := range csvdata {
 		go func(line map[string]string, c chan map[string]interface{}, ln int) {
 			newline := map[string]interface{}{}
-			for _, origkey := range head {
-				if key, ok := mapping[origkey]; ok {
-					err := processMapping(&newline, origkey, line, key)
+			for key, origkey := range mapping {
+				if strings.Contains(line[origkey], "ƒ") && !strings.HasSuffix(key, "}}") {
+					for _, part := range strings.Split(line[origkey], "ƒ") {
+						copy := make(map[string]string)
+						for key, value := range line {
+							copy[key] = value
+						}
+						copy[origkey] = part
+						err := processMapping(&newline, key, copy, origkey)
+						if err != nil {
+							panic(fmt.Sprintf("line %d: %v", ln, err))
+						}
+					}
+				} else {
+					err := processMapping(&newline, key, line, origkey)
 					if err != nil {
 						panic(fmt.Sprintf("line %d: %v", ln, err))
 					}
@@ -138,18 +243,20 @@ func main() {
 		}
 	}
 
-	headers := []string{}
-	for k := range out[0] {
-		headers = append(headers, k)
-	}
 	file, err := os.Create(os.Args[3])
+
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("Finished processing %d lines\nHeaders: %v\n", len(out), headers)
+	fmt.Printf("Finished processing %d lines\nHeaders: %v\n", len(out), order)
+
 	w := csv.NewWriter(file)
-	w.Comma = ';'
-	err = filehelper.OnlyWriteCSV(*w, headers, out)
+	if len(os.Args) > 4 && os.Args[4] != "" {
+		w.Comma = rune(os.Args[4][0])
+	} else {
+		w.Comma = ';'
+	}
+	err = filehelper.OnlyWriteCSV(*w, order, out)
 	if err != nil {
 		panic(err)
 	}
